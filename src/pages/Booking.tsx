@@ -1,0 +1,600 @@
+import React, { useEffect, useState } from 'react';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
+import api from '../services/api';
+import { Clock, DollarSign, ChevronLeft, ChevronRight, Check, ArrowLeft, MapPin, AlertCircle } from 'lucide-react';
+import {
+  format,
+  addMonths,
+  subMonths,
+  startOfMonth,
+  endOfMonth,
+  startOfWeek,
+  endOfWeek,
+  eachDayOfInterval,
+  isSameDay,
+  isBefore,
+  isToday,
+  addDays
+} from 'date-fns';
+import { es } from 'date-fns/locale';
+import { formatTimeToHHMM, toISOTimeString, generateSlotsForSchedule, getEffectiveDurationMinutes } from '../utils/timeHelper';
+import LoadingSpinner from '../components/common/LoadingSpinner';
+import { SkeletonDetail } from '../components/common/SkeletonLoaders';
+
+interface Business { id: number; name: string; address: string; description: string; }
+interface Service { id: number; name: string; description: string; durationMinutes: number; price: number; }
+interface Schedule { id: number; dayOfWeek: number; startTime: string; endTime: string; }
+
+type Step = 1 | 2 | 3;
+
+const Booking: React.FC = () => {
+  const { id } = useParams<{ id: string }>();
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+
+  const [business, setBusiness] = useState<Business | null>(null);
+  const [services, setServices] = useState<Service[]>([]);
+  const [schedules, setSchedules] = useState<Schedule[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  // Wizard state
+  const [step, setStep] = useState<Step>(1);
+  const [selectedService, setSelectedService] = useState<Service | null>(null);
+  const [currentMonth, setCurrentMonth] = useState(new Date());
+  const [selectedDate, setSelectedDate] = useState<Date | null>(new Date());
+  const [selectedTime, setSelectedTime] = useState<string | null>(null);
+
+  // Busy slots for selected date
+  const [busySlots, setBusySlots] = useState<string[]>([]);
+  const [loadingSlots, setLoadingSlots] = useState(false);
+
+  // Hold state
+  const [holdToken, setHoldToken] = useState<string | null>(null);
+  const [expiresAt, setExpiresAt] = useState<string | null>(null);
+  const [timeLeft, setTimeLeft] = useState(0);
+
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+
+  // 1. Cargar negocio, servicios y horarios de atención + preselección por query param
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        const [bRes, sRes, schRes] = await Promise.all([
+          api.get(`/businesses/${id}`),
+          api.get(`/businesses/${id}/services`),
+          api.get(`/businesses/${id}/schedules`)
+        ]);
+        setBusiness(bRes.data);
+
+        const loadedServices: Service[] = sRes.data.data ?? sRes.data ?? [];
+        setServices(loadedServices);
+
+        const loadedSchedules: Schedule[] = schRes.data.data ?? schRes.data ?? [];
+        setSchedules(loadedSchedules);
+
+        // Si viene ?serviceId en la URL, preseleccionar y avanzar directo al paso 2
+        const serviceIdParam = searchParams.get('serviceId');
+        if (serviceIdParam) {
+          const match = loadedServices.find(s => s.id === Number(serviceIdParam));
+          if (match) {
+            setSelectedService(match);
+            setStep(2);
+          }
+        }
+      } catch {
+        /* ignore */
+      } finally {
+        setLoading(false);
+      }
+    };
+    if (id) fetchData();
+  }, [id, searchParams]);
+
+  // 2. Cargar slots ocupados cuando cambia la fecha seleccionada
+  useEffect(() => {
+    if (!id || !selectedDate) {
+      setBusySlots([]);
+      return;
+    }
+    const dateStr = format(selectedDate, 'yyyy-MM-dd');
+    setLoadingSlots(true);
+    api.get(`/businesses/${id}/busy-slots?date=${dateStr}`)
+      .then(res => {
+        const rawList = res.data.data ?? [];
+        const formattedList = rawList.map((item: string) => formatTimeToHHMM(item));
+        setBusySlots(formattedList);
+      })
+      .catch(() => {
+        setBusySlots([]);
+      })
+      .finally(() => {
+        setLoadingSlots(false);
+      });
+  }, [id, selectedDate]);
+
+  // Countdown timer para el Hold Token
+  useEffect(() => {
+    let timer: ReturnType<typeof setInterval>;
+    if (expiresAt) {
+      timer = setInterval(() => {
+        const diff = new Date(expiresAt).getTime() - Date.now();
+        if (diff <= 0) {
+          clearInterval(timer);
+          setHoldToken(null);
+          setExpiresAt(null);
+          setTimeLeft(0);
+          setError('El tiempo de reserva temporal expiró. Por favor, selecciona el horario nuevamente.');
+          setStep(2);
+        } else {
+          setTimeLeft(Math.ceil(diff / 1000));
+        }
+      }, 1000);
+    }
+    return () => clearInterval(timer);
+  }, [expiresAt]);
+
+  // Construye la fecha y hora exacta en la zona horaria del cliente
+  const getSelectedDateTime = () => {
+    if (!selectedDate || !selectedTime) return null;
+    const [hours, minutes] = selectedTime.split(':').map(Number);
+    const dt = new Date(selectedDate);
+    dt.setHours(hours, minutes, 0, 0);
+    return dt;
+  };
+
+  // Helper para verificar si un slot ya pasó hoy
+  const isSlotPast = (slotTime: string) => {
+    if (!selectedDate || !isToday(selectedDate)) return false;
+    const [slotH, slotM] = slotTime.split(':').map(Number);
+    const now = new Date();
+    const currentH = now.getHours();
+    const currentM = now.getMinutes();
+    return slotH < currentH || (slotH === currentH && slotM <= currentM);
+  };
+
+  // Calendar helpers
+  const calendarDays = (() => {
+    const monthStart = startOfMonth(currentMonth);
+    const monthEnd = endOfMonth(currentMonth);
+    const calStart = startOfWeek(monthStart, { weekStartsOn: 1 });
+    const calEnd = endOfWeek(monthEnd, { weekStartsOn: 1 });
+    return eachDayOfInterval({ start: calStart, end: calEnd });
+  })();
+
+  const getBusinessDayOfWeek = (d: Date): number => {
+    const jsDay = d.getDay();
+    return jsDay === 0 ? 7 : jsDay;
+  };
+
+  const isPast = (d: Date) => isBefore(d, new Date()) && !isToday(d);
+  const isOutOfMonth = (d: Date) => d.getMonth() !== currentMonth.getMonth();
+
+  const isDayAvailable = (d: Date) => {
+    if (isOutOfMonth(d) || isPast(d)) return false;
+    if (schedules.length === 0) return true;
+    const dow = getBusinessDayOfWeek(d);
+    return schedules.some(s => s.dayOfWeek === dow);
+  };
+
+  // Si hoy no atiende o no está disponible, seleccionar automáticamente el primer día hábil
+  useEffect(() => {
+    if (schedules.length > 0 && selectedDate && !isDayAvailable(selectedDate)) {
+      const today = new Date();
+      for (let i = 0; i < 30; i++) {
+        const candidate = addDays(today, i);
+        if (isDayAvailable(candidate)) {
+          setSelectedDate(candidate);
+          setCurrentMonth(candidate);
+          break;
+        }
+      }
+    }
+  }, [schedules]);
+
+  const currentDaySchedules = React.useMemo(() => {
+    if (!selectedDate) return [];
+    const dow = getBusinessDayOfWeek(selectedDate);
+    return schedules
+      .filter(s => s.dayOfWeek === dow)
+      .sort((a, b) => {
+        const aTime = formatTimeToHHMM(a.startTime);
+        const bTime = formatTimeToHHMM(b.startTime);
+        return aTime.localeCompare(bTime);
+      });
+  }, [selectedDate, schedules]);
+
+  const slotGroups = React.useMemo(() => {
+    if (!selectedDate || !selectedService) return [];
+    const duration = selectedService.durationMinutes || 30;
+
+    if (currentDaySchedules.length > 0) {
+      return currentDaySchedules.map(sch => {
+        const startStr = formatTimeToHHMM(sch.startTime);
+        const endStr = formatTimeToHHMM(sch.endTime);
+        const [startH] = startStr.split(':').map(Number);
+        const isMorning = startH < 13;
+        const title = isMorning
+          ? `☀ Mañana (${startStr} – ${endStr})`
+          : `🌆 Tarde (${startStr} – ${endStr})`;
+        const slots = generateSlotsForSchedule(sch.startTime, sch.endTime, duration);
+        return { title, slots };
+      }).filter(g => g.slots.length > 0);
+    }
+
+    if (schedules.length === 0) {
+      const morningSlots = generateSlotsForSchedule('09:00', '13:00', duration);
+      const afternoonSlots = generateSlotsForSchedule('13:00', '18:00', duration);
+      return [
+        { title: '☀ Mañana (09:00 – 13:00)', slots: morningSlots },
+        { title: '🌆 Tarde (13:00 – 18:00)', slots: afternoonSlots }
+      ];
+    }
+
+    return [];
+  }, [selectedDate, selectedService, currentDaySchedules, schedules]);
+
+  const isSlotUnavailable = (slotTime: string) => {
+    if (!selectedService) return true;
+    const effectiveDuration = getEffectiveDurationMinutes(selectedService.durationMinutes);
+    const slotsCount = effectiveDuration / 30;
+    const [h, m] = slotTime.split(':').map(Number);
+    const startM = h * 60 + m;
+
+    for (let i = 0; i < slotsCount; i++) {
+      const curM = startM + i * 30;
+      const curH = Math.floor(curM / 60);
+      const curMin = curM % 60;
+      const subSlot = `${String(curH).padStart(2, '0')}:${String(curMin).padStart(2, '0')}`;
+      if (isSlotPast(subSlot) || busySlots.includes(subSlot)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const handleHold = async () => {
+    if (!selectedDate || !selectedTime || !selectedService) return;
+
+    const localDateTime = getSelectedDateTime();
+    if (!localDateTime) return;
+
+    if (localDateTime.getTime() <= Date.now()) {
+      setError('El horario seleccionado ya ha transcurrido. Por favor, elige un horario futuro.');
+      return;
+    }
+
+    if (isSlotUnavailable(selectedTime)) {
+      setError('El horario seleccionado no cuenta con los bloques de tiempo libres requeridos.');
+      return;
+    }
+
+    setSubmitting(true);
+    setError('');
+    try {
+      const dateStr = format(selectedDate, 'yyyy-MM-dd');
+      const res = await api.post('/appointments/hold', {
+        businessId: Number(id),
+        serviceId: selectedService.id,
+        date: `${dateStr}T00:00:00.000Z`,
+        time: toISOTimeString(selectedTime),
+      });
+      setHoldToken(res.data.holdToken);
+      setExpiresAt(res.data.expiresAt);
+      setStep(3);
+    } catch (err: any) {
+      setError(err.response?.data?.message || err.response?.data?.detail || 'Error al reservar el horario.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleConfirm = async () => {
+    if (!holdToken || !selectedDate || !selectedTime || !selectedService) return;
+
+    setSubmitting(true);
+    setError('');
+    try {
+      const dateStr = format(selectedDate, 'yyyy-MM-dd');
+      await api.post('/appointments', {
+        businessId: Number(id),
+        serviceId: selectedService.id,
+        date: `${dateStr}T00:00:00.000Z`,
+        time: toISOTimeString(selectedTime),
+        holdToken,
+      });
+      navigate('/my-appointments');
+    } catch (err: any) {
+      setError(err.response?.data?.message || err.response?.data?.detail || 'Error al confirmar el turno.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (loading) return <SkeletonDetail />;
+  if (!business) return <div>Negocio no encontrado</div>;
+
+  const businessInitials = business.name.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase();
+
+  return (
+    <div style={{ maxWidth: '950px', margin: '0 auto' }}>
+      <button onClick={() => navigate(-1)} className="btn btn-light" style={{ marginBottom: '1.25rem', fontSize: '0.88rem' }}>
+        <ArrowLeft size={16} /> Volver
+      </button>
+
+      <div className="wizard-card">
+        {/* Sidebar Azul */}
+        <div className="wizard-sidebar">
+          <div>
+            {/* Logo del negocio */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.875rem', marginBottom: '1rem' }}>
+              <div style={{ width: '56px', height: '56px', borderRadius: '50%', background: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800, fontSize: '1.1rem', color: 'var(--primary-color)', flexShrink: 0 }}>
+                {businessInitials}
+              </div>
+              <div style={{ overflow: 'hidden' }}>
+                <h5 style={{ fontWeight: 800, marginBottom: '2px', color: 'white', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{business.name}</h5>
+                {business.address && (
+                  <p style={{ fontSize: '0.82rem', color: 'rgba(255,255,255,0.8)', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                    <MapPin size={12} /> {business.address}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {selectedService && (
+              <div style={{ background: 'rgba(255,255,255,0.1)', borderRadius: '10px', padding: '12px', marginBottom: '1.25rem' }}>
+                <p style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.7)', fontWeight: 600, marginBottom: '4px' }}>SERVICIO SELECCIONADO</p>
+                <p style={{ color: 'white', fontWeight: 700 }}>{selectedService.name}</p>
+                <p style={{ color: 'rgba(255,255,255,0.8)', fontSize: '0.82rem' }}>{selectedService.durationMinutes} min · ${selectedService.price}</p>
+              </div>
+            )}
+
+            {selectedDate && selectedTime && (
+              <div style={{ background: 'rgba(255,255,255,0.1)', borderRadius: '10px', padding: '12px', marginBottom: '1.25rem' }}>
+                <p style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.7)', fontWeight: 600, marginBottom: '4px' }}>FECHA Y HORA</p>
+                <p style={{ color: 'white', fontWeight: 700 }}>{format(selectedDate, "d 'de' MMMM, yyyy", { locale: es })}</p>
+                <p style={{ color: 'rgba(255,255,255,0.8)', fontSize: '0.82rem' }}>{selectedTime} hs</p>
+              </div>
+            )}
+          </div>
+
+          {/* Indicadores de pasos */}
+          <div>
+            {[
+              { num: 1, label: 'Seleccionar Servicio' },
+              { num: 2, label: 'Elegir Fecha y Hora' },
+              { num: 3, label: 'Confirmación' },
+            ].map(s => (
+              <div key={s.num} className={`step-indicator-item ${step >= s.num ? 'active' : ''}`}>
+                <div className="step-num">
+                  {step > s.num ? <Check size={14} /> : s.num}
+                </div>
+                <span style={{ fontSize: '0.88rem', fontWeight: 600 }}>{s.label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Contenido del wizard */}
+        <div className="wizard-content">
+          {error && (
+            <div className="alert-danger" style={{ marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <AlertCircle size={16} />
+              <span>{error}</span>
+            </div>
+          )}
+
+          {/* PASO 1: Selección de Servicio */}
+          {step === 1 && (
+            <>
+              <h4 style={{ fontWeight: 800, color: 'var(--text-title)', marginBottom: '4px' }}>Elige un Servicio</h4>
+              <p className="text-muted text-sm" style={{ marginBottom: '1.25rem' }}>Selecciona el tratamiento o servicio que deseas agendar.</p>
+              <div className="services-wizard-grid">
+                {services.map(svc => (
+                  <div
+                    key={svc.id}
+                    className={`service-card-wizard ${selectedService?.id === svc.id ? 'selected' : ''}`}
+                    onClick={() => setSelectedService(svc)}
+                  >
+                    <div className="checkmark"><Check size={12} /></div>
+                    <h5 style={{ fontWeight: 700, fontSize: '0.95rem', marginBottom: '4px', color: 'var(--text-title)' }}>{svc.name}</h5>
+                    <p className="text-muted text-xs" style={{ marginBottom: '10px', flexGrow: 1 }}>{svc.description}</p>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <Clock size={13} /> {svc.durationMinutes} min
+                      </span>
+                      <span style={{ fontWeight: 700, color: 'var(--status-success-text)', fontSize: '0.95rem', display: 'flex', alignItems: 'center', gap: '2px' }}>
+                        <DollarSign size={14} />{svc.price}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ marginTop: 'auto', paddingTop: '1.25rem' }}>
+                <button
+                  className="btn btn-primary btn-full"
+                  disabled={!selectedService}
+                  onClick={() => setStep(2)}
+                  style={{ padding: '0.75rem' }}
+                >
+                  Continuar con fecha y hora
+                </button>
+              </div>
+            </>
+          )}
+
+          {/* PASO 2: Calendario + Horarios */}
+          {step === 2 && (
+            <>
+              <h4 style={{ fontWeight: 800, color: 'var(--text-title)', marginBottom: '4px' }}>Fecha y Hora</h4>
+              <p className="text-muted text-sm" style={{ marginBottom: '1.25rem' }}>Elige el día y selecciona un horario disponible.</p>
+
+              {/* Calendario mensual */}
+              <div className="calendar-wrapper" style={{ marginBottom: '1.25rem' }}>
+                <div className="calendar-header">
+                  <button className="calendar-nav-btn" onClick={() => setCurrentMonth(m => subMonths(m, 1))}>
+                    <ChevronLeft size={16} />
+                  </button>
+                  <h6>{format(currentMonth, "MMMM yyyy", { locale: es })}</h6>
+                  <button className="calendar-nav-btn" onClick={() => setCurrentMonth(m => addMonths(m, 1))}>
+                    <ChevronRight size={16} />
+                  </button>
+                </div>
+                <div className="calendar-days-grid">
+                  {['Lu', 'Ma', 'Mi', 'Ju', 'Vi', 'Sa', 'Do'].map(d => (
+                    <div key={d} className="calendar-day-name">{d}</div>
+                  ))}
+                  {calendarDays.map((day, i) => {
+                    const outOfMonth = isOutOfMonth(day);
+                    const isAvailable = isDayAvailable(day);
+                    const todayDay = isToday(day);
+                    const isSelected = selectedDate && isSameDay(day, selectedDate);
+                    return (
+                      <button
+                        key={i}
+                        className={`calendar-day-btn ${outOfMonth ? 'empty' : ''} ${isAvailable ? 'available' : ''} ${isSelected ? 'selected' : ''} ${todayDay ? 'today' : ''}`}
+                        disabled={!isAvailable}
+                        onClick={() => {
+                          setSelectedDate(day);
+                          setSelectedTime(null);
+                        }}
+                        style={{ color: outOfMonth ? '#cbd5e1' : undefined }}
+                      >
+                        {format(day, 'd')}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Slots de horarios */}
+              {selectedDate && (
+                <div>
+                  {loadingSlots ? (
+                    <div style={{ padding: '0.5rem 0', display: 'flex', alignItems: 'center' }}>
+                      <LoadingSpinner size="sm" inline text="Actualizando horarios disponibles..." />
+                    </div>
+                  ) : null}
+
+                  {slotGroups.length === 0 ? (
+                    <div style={{ padding: '1.5rem', textAlign: 'center', background: 'var(--bg-card)', borderRadius: '12px', border: '1px dashed var(--border-color)', margin: '1rem 0' }}>
+                      <Clock size={28} style={{ color: 'var(--text-secondary)', marginBottom: '0.5rem' }} />
+                      <p style={{ fontWeight: 600, color: 'var(--text-title)', marginBottom: '4px' }}>No hay turnos disponibles para este día</p>
+                      <p className="text-muted text-xs">El negocio no atiende en la fecha seleccionada o la duración del servicio ({selectedService?.durationMinutes} min) excede el horario de atención.</p>
+                    </div>
+                  ) : (
+                    slotGroups.map((group, gIdx) => (
+                      <div key={gIdx} style={{ marginTop: gIdx > 0 ? '0.875rem' : '0.25rem', marginBottom: '0.625rem' }}>
+                        <p className="slots-section-title">{group.title}</p>
+                        <div className="slots-flex">
+                          {group.slots.map(t => {
+                            const isDisabled = isSlotUnavailable(t);
+                            const isSelected = selectedTime === t;
+
+                            return (
+                              <button
+                                key={t}
+                                disabled={isDisabled}
+                                className={`btn-slot-pill ${isSelected ? 'active' : ''}`}
+                                onClick={() => !isDisabled && setSelectedTime(t)}
+                                title={isDisabled ? 'Horario no disponible' : 'Disponible'}
+                                style={isDisabled ? {
+                                  opacity: 0.35,
+                                  cursor: 'not-allowed',
+                                  background: '#f1f5f9',
+                                  borderColor: '#cbd5e1',
+                                  color: '#94a3b8',
+                                  textDecoration: 'line-through'
+                                } : {}}
+                              >
+                                {t}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+
+              <div style={{ display: 'flex', gap: '0.75rem', marginTop: 'auto', paddingTop: '1.25rem' }}>
+                <button className="btn btn-light" onClick={() => setStep(1)}>
+                  <ChevronLeft size={16} /> Cambiar servicio
+                </button>
+                <button
+                  className="btn btn-primary"
+                  style={{ flex: 1, padding: '0.75rem' }}
+                  disabled={!selectedDate || !selectedTime || submitting}
+                  onClick={handleHold}
+                >
+                  {submitting ? 'Reservando...' : 'Reservar este horario'}
+                </button>
+              </div>
+            </>
+          )}
+
+          {/* PASO 3: Confirmación Final */}
+          {step === 3 && selectedService && selectedDate && selectedTime && (
+            <>
+              <h4 style={{ fontWeight: 800, color: 'var(--text-title)', marginBottom: '4px' }}>Confirmar Reserva</h4>
+              <p className="text-muted text-sm" style={{ marginBottom: '1.5rem' }}>Verifica los detalles de tu cita antes de confirmar.</p>
+
+              {timeLeft > 0 && (
+                <div className="alert-info" style={{ marginBottom: '1.25rem', textAlign: 'center' }}>
+                  ⏱ Horario bloqueado — Te quedan{' '}
+                  <strong>{Math.floor(timeLeft / 60)}:{(timeLeft % 60).toString().padStart(2, '0')}</strong> min para confirmar
+                </div>
+              )}
+
+              <div className="receipt-container" style={{ marginBottom: '1.5rem' }}>
+                <div style={{ textAlign: 'center', marginBottom: '1rem' }}>
+                  <div style={{ color: 'var(--status-success-text)', marginBottom: '6px', fontSize: '2rem' }}>✓</div>
+                  <p style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Detalles de la Reserva</p>
+                </div>
+                <div className="receipt-divider" />
+                <div style={{ marginBottom: '0.875rem' }}>
+                  <p className="text-sm text-muted fw-semibold">Servicio Seleccionado</p>
+                  <p style={{ fontSize: '1.1rem', fontWeight: 800, color: 'var(--text-title)' }}>{selectedService.name}</p>
+                  {selectedService.description && <p className="text-sm text-muted">{selectedService.description}</p>}
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.875rem', marginBottom: '0.875rem' }}>
+                  <div>
+                    <p className="text-xs text-muted fw-semibold">Fecha y Hora</p>
+                    <p style={{ fontWeight: 700, color: 'var(--primary-color)' }}>
+                      {format(selectedDate, "d MMM yyyy", { locale: es })} – {selectedTime} hs
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-muted fw-semibold">Duración</p>
+                    <p style={{ fontWeight: 700 }}>{selectedService.durationMinutes} minutos</p>
+                  </div>
+                </div>
+                <div className="receipt-divider" />
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <p className="text-sm fw-semibold">Total a abonar</p>
+                  <p style={{ fontSize: '1.4rem', fontWeight: 800, color: 'var(--status-success-text)' }}>${selectedService.price}</p>
+                </div>
+              </div>
+
+              <button
+                className="btn btn-success-fill btn-full"
+                style={{ padding: '0.875rem', fontSize: '1rem' }}
+                disabled={submitting || timeLeft === 0}
+                onClick={handleConfirm}
+              >
+                {submitting ? (
+                  <LoadingSpinner size="sm" inline text="Confirmando turno..." color="white" />
+                ) : (
+                  '✓ Confirmar Turno Definitivamente'
+                )}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default Booking;
